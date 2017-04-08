@@ -8,6 +8,10 @@ module JavaScript.Web.XMLHttpRequest ( xhr
                                      , xhrByteString
                                      , xhrText
                                      , xhrString
+                                     , xhrE
+                                     , xhrByteStringE
+                                     , xhrTextE
+                                     , xhrStringE
                                      , Method(..)
                                      , Request(..)
                                      , RequestData(..)
@@ -57,7 +61,7 @@ data Method = GET | POST | PUT | DELETE
 
 data XHRError = XHRError String
               | XHRAborted
-              deriving (Generic, Data, Typeable, Show, Eq) 
+              deriving (Generic, Data, Typeable, Show, Eq)
 
 instance Exception XHRError
 
@@ -135,11 +139,11 @@ xhr req = js_createXHR >>= \x ->
         js_setResponseType
           (getResponseTypeString (Proxy :: Proxy a)) x
         forM_ (reqHeaders req) (\(n,v) -> js_setRequestHeader n v x)
-        
+
         case reqWithCredentials req of
           True  -> js_setWithCredentials x
           False -> return ()
-        
+
         r <- case reqData req of
           NoData                            ->
             js_send0 x
@@ -196,6 +200,73 @@ xhrText = fmap (fmap textFromJSString) . xhr
 xhrByteString :: Request -> IO (Response ByteString)
 xhrByteString = fmap
   (fmap (Buffer.toByteString 0 Nothing . Buffer.createFromArrayBuffer)) . xhr
+
+-- -----------------------------------------------------------------------------
+-- main entry point
+-- this version of xhr returns Either String Response - Left if there's an error
+
+xhrE :: forall a. ResponseType a => Request -> IO (Either String (Response a))
+xhrE req = js_createXHR >>= \x ->
+  let doRequest = do
+        case reqLogin req of
+          Nothing           ->
+            js_open2 (methodJSString (reqMethod req)) (reqURI req) x
+          Just (user, pass) ->
+            js_open4 (methodJSString (reqMethod req)) (reqURI req) user pass x
+        js_setResponseType
+          (getResponseTypeString (Proxy :: Proxy a)) x
+        forM_ (reqHeaders req) (\(n,v) -> js_setRequestHeader n v x)
+
+        case reqWithCredentials req of
+          True  -> js_setWithCredentials x
+          False -> return ()
+
+        r <- case reqData req of
+          NoData                            ->
+            js_send0 x
+          StringData str                    ->
+            js_send1 (pToJSVal str) x
+          TypedArrayData (SomeTypedArray t) ->
+            js_send1 t x
+          FormData xs                       -> do
+            fd@(JSFormData fd') <- js_createFormData
+            forM_ xs $ \(name, val) -> case val of
+              StringVal str               ->
+                js_appendFormData2 name (pToJSVal str) fd
+              BlobVal (SomeBlob b) mbFile ->
+                appendFormData name b mbFile fd
+              FileVal (SomeBlob b) mbFile ->
+                appendFormData name b mbFile fd
+            js_send1 fd' x
+        case r of
+          0 -> do
+            status <- js_getStatus x
+            r      <- do
+              hr <- js_hasResponse x
+              if hr then Just . wrapResponseType <$> js_getResponse x
+                    else pure Nothing
+            return $ Right $ Response r
+                              status
+                              (js_getAllResponseHeaders x)
+                              (\h -> getResponseHeader' h x)
+--          1 -> throwIO XHRAborted
+--          2 -> throwIO (XHRError "network request error")
+          1 -> js_abort x >> return (Left "Aborted") --throwIO XHRAborted
+          2 -> js_abort x >> return (Left "network request error") --throwIO (XHRError "network request error")
+  in doRequest -- `onException` js_abort x
+
+-- -----------------------------------------------------------------------------
+-- utilities
+
+xhrStringE :: Request -> IO (Either String (Response String))
+xhrStringE = fmap (fmap (fmap JSS.unpack)) . xhrE
+
+xhrTextE :: Request -> IO (Either String (Response Text))
+xhrTextE = fmap (fmap (fmap textFromJSString)) . xhrE
+
+xhrByteStringE :: Request -> IO (Either String (Response ByteString))
+xhrByteStringE = fmap
+  (fmap (fmap (Buffer.toByteString 0 Nothing . Buffer.createFromArrayBuffer))) . xhrE
 
 -- -----------------------------------------------------------------------------
 
